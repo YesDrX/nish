@@ -1,0 +1,11 @@
+nimcache/
+*.out
+nish
+src/nish
+tests/t_search
+tests/t_history
+tests/t_perf
+tests/t_complete
+tests/t_keys
+tests/t_config
+tests/t_alias
