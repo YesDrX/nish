@@ -30,7 +30,9 @@
 ## decoder cannot see Ctrl/Alt+arrows (it eats them and leaks "5D"-style
 ## garbage into the buffer) nor C0 byte 0x1E (Ctrl+>), so this module
 ## reads the tty itself with a superset decoder and unknown sequences are
-## consumed fully (never leaked). ISIG stays on: Ctrl+C arrives via SIGINT
+## consumed fully (never leaked) — incl. mouse reports (SGR/urxvt/X10),
+## which nish also proactively disables at startup (it never uses the
+## mouse). ISIG stays on: Ctrl+C arrives via SIGINT
 ## and Ctrl+\ / Ctrl+< (both C0 0x1C, indistinguishable) via SIGQUIT, which
 ## nish catches as word-left instead of dying (children keep the default
 ## disposition, so Ctrl+\ still quits a runaway child).
@@ -185,6 +187,18 @@ when defined(windows):
     except CatchableError:
       discard
 
+when defined(posix):
+  proc disableMouseTracking() =
+    ## nish never uses the mouse, but tracking may be left enabled by a
+    ## previous program (or forwarded by tmux with `mouse on`): without
+    ## this, every click/motion arrives as `ESC[<...M` input. Harmless when
+    ## already off; unknown modes are ignored by the terminal.
+    try:
+      stdout.write("\e[?1000l\e[?1002l\e[?1003l\e[?1006l\e[?1015l")
+      stdout.flushFile()
+    except IOError:
+      discard
+
 proc editorInit*() =
   when defined(windows):
     enableVT()
@@ -192,6 +206,7 @@ proc editorInit*() =
   showCursor()
   stdout.flushFile()
   when defined(posix):
+    disableMouseTracking()
     signal(SIGINT, sigIntHandler)
     signal(SIGQUIT, sigQuitHandler)
   when defined(windows):
@@ -231,6 +246,7 @@ proc resumeAfterExec*() =
     showCursor()
     stdout.flushFile()
     when defined(posix):
+      disableMouseTracking() # child may have left tracking on
       signal(SIGINT, sigIntHandler) # re-arm (C signal() may be one-shot)
       signal(SIGQUIT, sigQuitHandler)
     when defined(windows):
@@ -266,6 +282,52 @@ when defined(posix):
     elif lead < 0xF8: 4
     else: 1
 
+  proc readCsiTail(): KKind =
+    ## Consume bytes after `ESC [` (or C1 CSI 0x9B) up to and including the
+    ## final byte, so unknown sequences never leak into the buffer as typed
+    ## text. Notably mouse reports: SGR `<btn;x;yM/m`, urxvt `Cb;Cx;CyM`,
+    ## and X10 `M` + 3 data bytes. Known sequences return their key kind,
+    ## everything else kkNone.
+    var params = ""
+    var private = '\0' # single private-marker prefix (< = > ?)
+    while true:
+      let b = readByteTimeout(60)
+      if b < 0:
+        return kkNone
+      let c = chr(b)
+      if c in {'<', '=', '>', '?'} and params.len == 0 and private == '\0':
+        private = c
+        continue
+      if (c >= '0' and c <= '9') or c == ';' or c == ':':
+        params.add(c)
+        continue
+      if c >= ' ' and c <= '/':
+        continue # intermediate bytes: swallow for robustness
+      # final byte (@..~)
+      if private != '\0':
+        return kkNone # incl. SGR mouse: fully consumed above
+      if c == 'M' and params.len == 0:
+        # X10 mouse: `ESC [ M` + button, x+32, y+32
+        for _ in 0 ..< 3:
+          if readByteTimeout(60) < 0:
+            return kkNone
+        return kkNone
+      return csiKind(params, c)
+
+  proc readUntilSt(): KKind =
+    ## Consume an OSC/DCS/SOS/PM/APC payload until BEL or ST (`ESC \`);
+    ## always kkNone (such sequences are never input).
+    while true:
+      let b = readByteTimeout(60)
+      if b < 0:
+        return kkNone
+      if b == 0x07:
+        return kkNone
+      if b == 0x1B:
+        if readByteTimeout(60) < 0:
+          return kkNone
+        return kkNone # ST (or a stray ESC: drop it too, stay silent)
+
   proc readKeys(timeoutMs: int): tuple[kind: KKind, text: string] =
     ## Own tty decoder (illwill can't see modified arrows / 0x1E and leaks
     ## partial sequences as typed text). Unknown sequences are consumed
@@ -282,21 +344,23 @@ when defined(posix):
       if b1 < 0:
         return (kkEscape, "")
       if b1 == ord('['):
-        var params = ""
-        while true:
-          let b = readByteTimeout(60)
-          if b < 0:
-            return (kkNone, "")
-          let c = chr(b)
-          if (c >= '0' and c <= '9') or c == ';':
-            params.add(c)
-            continue
-          return (csiKind(params, c), "")
+        return (readCsiTail(), "")
       elif b1 == ord('O'):
         let b2 = readByteTimeout(60)
         if b2 < 0:
           return (kkNone, "")
-        case chr(b2):
+        let c2 = chr(b2)
+        if (c2 >= '0' and c2 <= '9') or c2 == ';':
+          # xterm modified F1-F4 (`ESC O 1;2 P`): swallow params + final
+          while true:
+            let b = readByteTimeout(60)
+            if b < 0:
+              return (kkNone, "")
+            let c = chr(b)
+            if (c >= '0' and c <= '9') or c == ';':
+              continue
+            return (kkNone, "")
+        case c2:
         of 'A': result = (kkUp, "")
         of 'B': result = (kkDown, "")
         of 'C': result = (kkRight, "")
@@ -304,7 +368,15 @@ when defined(posix):
         of 'H': result = (kkHome, "")
         of 'F': result = (kkEnd, "")
         else: result = (kkNone, "")
+      elif b1 in [ord(']'), ord('P'), ord('X'), ord('^'), ord('_')]:
+        return (readUntilSt(), "")
       else:
+        if b1 >= 0x80:
+          # Alt+non-ASCII: swallow the full UTF-8 unit, never leak partials
+          for _ in 1 ..< utf8Len(b1):
+            if readByteTimeout(60) < 0:
+              break
+          return (kkNone, "")
         # Alt+key (ESC-prefixed)
         case chr(b1):
         of 'b', 'B': result = (kkWordLeft, "")
@@ -315,14 +387,23 @@ when defined(posix):
       if asciiKind(b0) == kkText: result = (kkText, $chr(b0))
       else: result = (c0Kind(b0), "")
     else:
-      # UTF-8 passthrough as one unit (illwill drops these bytes)
-      var s = $chr(b0)
-      for _ in 1 ..< utf8Len(b0):
-        let b = readByteTimeout(60)
-        if b < 0:
-          break
-        s.add(chr(b))
-      result = (kkText, s)
+      if b0 == 0x9B:
+        result = (readCsiTail(), "") # C1 CSI (xterm can send it in UTF-8 mode)
+      elif b0 in [0x90, 0x98, 0x9D, 0x9E, 0x9F]:
+        result = (readUntilSt(), "") # C1 OSC/DCS/SOS/PM/APC
+      elif b0 < 0xC0:
+        # Stray C1/continuation byte: never valid as a first byte, drop it
+        # silently instead of leaking it into the buffer as text.
+        result = (kkNone, "")
+      else:
+        # UTF-8 passthrough as one unit (illwill drops these bytes)
+        var s = $chr(b0)
+        for _ in 1 ..< utf8Len(b0):
+          let b = readByteTimeout(60)
+          if b < 0:
+            break
+          s.add(chr(b))
+        result = (kkText, s)
 
 when defined(windows):
   const
