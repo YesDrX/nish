@@ -10,8 +10,12 @@ writeFile(tree / ".hidden", "x")
 writeFile(tree / "alpine" / "inner.txt", "x")
 let bin = base / "bin"
 createDir(bin)
-writeFile(bin / "mycmd", "#!/bin/sh\n")
-writeFile(bin / "readme", "x")
+when defined(windows):
+  writeFile(bin / "mycmd.exe", "x")
+  writeFile(bin / "readme.txt", "x")
+else:
+  writeFile(bin / "mycmd", "#!/bin/sh\n")
+  writeFile(bin / "readme", "x")
 when defined(posix):
   setFilePermissions(bin / "mycmd",
     {fpUserExec, fpUserRead, fpGroupRead, fpOthersRead})
@@ -28,7 +32,11 @@ block:
 
 # dotfiles only on dotted base
 block:
-  assert pathCandidates(tree / ".h").mapIt(it.split('/')[^1]) == @[".hidden"]
+  when defined(windows):
+    assert pathCandidates(tree / ".h").mapIt(
+      it.split({'/', '\\'})[^1]) == @[".hidden"]
+  else:
+    assert pathCandidates(tree / ".h").mapIt(it.split('/')[^1]) == @[".hidden"]
   assert pathCandidates(tree / "").mapIt(it.split('/')[^1]).filterIt(
     it.startsWith(".")) == @[]
 
@@ -37,7 +45,7 @@ block:
   let old = getCurrentDir()
   setCurrentDir(tree)
   assert pathCandidates("be") == @["beta"]
-  assert pathCandidates("") == @["alpine/", "alpha.txt", "beta"]
+  assert pathCandidates("") == @["alpine" & $DirSep, "alpha.txt", "beta"]
   setCurrentDir(old)
 
 # no match
@@ -46,14 +54,22 @@ block:
 
 # commands: PATH exes + builtins, non-exec excluded
 block:
-  let c = commandCandidates("m", bin)
-  assert "mycmd" in c, "got " & $c
-  assert "readme" notin c
+  when defined(windows):
+    let c = commandCandidates("m", bin)
+    assert "mycmd.exe" in c, "got " & $c
+    assert "readme.txt" notin c
+  else:
+    let c = commandCandidates("m", bin)
+    assert "mycmd" in c, "got " & $c
+    assert "readme" notin c
   assert "history" in commandCandidates("hi", bin)
 
 # dispatch
 block:
-  assert completeCandidates("my", true, bin) == @["mycmd"]
+  when defined(windows):
+    assert completeCandidates("my", true, bin) == @["mycmd.exe"]
+  else:
+    assert completeCandidates("my", true, bin) == @["mycmd"]
   assert completeCandidates(tree / "al", true) ==
     @[tree / "alpine/", tree / "alpha.txt"]
   assert completeCandidates("be", false) == pathCandidates("be")

@@ -1,7 +1,8 @@
 ## exec.nim - command execution.
 ##
-## v1 strategy (per spec): everything is passed through to bash
-## (`bash -c <line>`, inheriting stdio so interactive programs work).
+## v1 strategy (per spec): everything is passed through to the shell
+## (`bash -c <line>` on POSIX, `powershell -Command <line>` on Windows,
+## inheriting stdio so interactive programs work).
 ## A few builtins must run in-process to be meaningful: cd, exit,
 ## export/unset, history, clear, help. First-word aliases (bash files +
 ## nish.yaml) expand before dispatch, so `alias ll='ls -l'` keeps working.
@@ -11,20 +12,39 @@ import history, editor, config, alias
 
 proc shellName*(): string =
   when defined(windows):
-    getEnv("NISH_SHELL", "cmd")
+    getEnv("NISH_SHELL", "powershell")
   else:
     getEnv("NISH_SHELL", "bash")
 
+proc shellBase*(): string =
+  ## Lowercase exe name without extension: powershell, pwsh, cmd, bash...
+  var b = extractFilename(shellName()).toLowerAscii()
+  if b.endsWith(".exe"):
+    b = b[0 .. ^5]
+  b
+
 proc runPassthrough*(line: string): int =
-  ## Run via bash -c with inherited stdio. Restores cooked mode around it.
+  ## Run via the configured shell with inherited stdio. Restores cooked
+  ## mode around it. POSIX: `bash -c`; Windows PowerShell:
+  ## `powershell -NoLogo -NoProfile -Command`; cmd: `cmd /c`.
   suspendForExec()
+  let shell = shellName()
+  let base = shellBase()
+  var args: seq[string]
+  if base in ["powershell", "pwsh"]:
+    args = @["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass",
+      "-Command", line]
+  elif base == "cmd":
+    args = @["/c", line]
+  else:
+    args = @["-c", line]
   try:
-    var p = startProcess("bash", args = ["-c", line],
+    var p = startProcess(shell, args = args,
       options = {poParentStreams, poUsePath})
     result = p.waitForExit()
     p.close()
   except OSError as e:
-    stderr.writeLine("nish: cannot run bash: " & e.msg)
+    stderr.writeLine("nish: cannot run " & shell & ": " & e.msg)
     result = 127
   finally:
     resumeAfterExec()
@@ -96,8 +116,11 @@ proc runLine*(line: string, hist: var History,
     return (0, false)
   of "help":
     echo "nish builtins: cd, exit, export, unset, history [-c], clear, help"
-    echo "everything else runs via: bash -c <line>"
-    echo "first-word aliases from ~/.bashrc, ~/.bash_aliases and nish.yaml apply"
+    echo "everything else runs via: " & shellName() & " (" &
+      (if shellBase() in ["powershell", "pwsh"]: "-Command <line>"
+       elif shellBase() == "cmd": "/c <line>"
+       else: "-c <line>") & ")"
+    echo "first-word aliases from ~/.bashrc, ~/.bash_aliases and nish.yaml apply (bash only)"
     echo "keys: type to filter (Enter runs typed line), Up/Down browse & edit," &
       " Tab completes path (repeat to cycle), Ctrl+Left/Right or Ctrl+</>" &
       " jump word, Esc dismisses"

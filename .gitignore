@@ -1,5 +1,7 @@
 nimcache/
 *.out
+*.exe
+*.pdb
 nish
 src/nish
 tests/t_search

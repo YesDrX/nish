@@ -36,7 +36,10 @@
 ## disposition, so Ctrl+\ still quits a runaway child).
 
 import illwill, unicode, os, strutils
-import posix except Key # posix.Key (SysV IPC) would shadow illwill.Key
+when defined(posix):
+  import posix except Key # posix.Key (SysV IPC) would shadow illwill.Key
+when defined(windows):
+  import winlean
 import prompt, history, search, complete, config
 
 const TokSeps = {' ', '\t', '|', '&', ';', '(', ')', '<', '>', '$', '"',
@@ -143,26 +146,56 @@ proc asciiKind*(b0: int): KKind =
   else: c0Kind(b0)
 
 var ctrlCFlag {.volatile.}: bool = false
-var sigQuitFlag {.volatile.}: bool = false
+when defined(posix):
+  var sigQuitFlag {.volatile.}: bool = false
 
 type EditorMode = enum mOff, mOn, mSuspended
 var gMode = mOff
 
-proc sigIntHandler(sig: cint) {.noconv.} =
-  ctrlCFlag = true
+when defined(posix):
+  proc sigIntHandler(sig: cint) {.noconv.} =
+    ctrlCFlag = true
 
-proc sigQuitHandler(sig: cint) {.noconv.} =
-  # C0 0x1C is both Ctrl+\ and (on basic terminals) Ctrl+<. Catching it
-  # keeps the shell alive; the editor treats it as word-left. Caught
-  # dispositions reset on exec, so spawned children keep normal SIGQUIT.
-  sigQuitFlag = true
+  proc sigQuitHandler(sig: cint) {.noconv.} =
+    # C0 0x1C is both Ctrl+\ and (on basic terminals) Ctrl+<. Catching it
+    # keeps the shell alive; the editor treats it as word-left. Caught
+    # dispositions reset on exec, so spawned children keep normal SIGQUIT.
+    sigQuitFlag = true
+
+when defined(windows):
+  proc winCtrlCHook() {.noconv.} =
+    ctrlCFlag = true
+
+  proc getConsoleMode(hConsoleHandle: Handle,
+      dwMode: ptr DWORD): WINBOOL {.
+      stdcall, dynlib: "kernel32", importc: "GetConsoleMode".}
+  proc setConsoleMode(hConsoleHandle: Handle,
+      dwMode: DWORD): WINBOOL {.
+      stdcall, dynlib: "kernel32", importc: "SetConsoleMode".}
+  const EnableVtProc = 0x0004.DWORD # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+
+  proc enableVT() =
+    ## PowerShell/conhost need VT processing for the ANSI blit.
+    ## No-op when the handle is redirected; never fails the shell.
+    try:
+      var mode: DWORD = 0
+      let hOut = getStdHandle(STD_OUTPUT_HANDLE)
+      if getConsoleMode(hOut, addr mode) != 0:
+        discard setConsoleMode(hOut, mode or EnableVtProc)
+    except CatchableError:
+      discard
 
 proc editorInit*() =
+  when defined(windows):
+    enableVT()
   illwillInit(fullscreen = false)
   showCursor()
   stdout.flushFile()
-  signal(SIGINT, sigIntHandler)
-  signal(SIGQUIT, sigQuitHandler)
+  when defined(posix):
+    signal(SIGINT, sigIntHandler)
+    signal(SIGQUIT, sigQuitHandler)
+  when defined(windows):
+    setControlCHook(winCtrlCHook)
   gMode = mOn
 
 proc editorDeinit*() =
@@ -177,10 +210,13 @@ proc takeCtrlC*(): bool =
   false
 
 proc takeSigQuit*(): bool =
-  if sigQuitFlag:
-    sigQuitFlag = false
-    return true
-  false
+  when defined(posix):
+    if sigQuitFlag:
+      sigQuitFlag = false
+      return true
+    false
+  else:
+    false
 
 proc suspendForExec*() =
   ## Restore cooked terminal before spawning the child (no-op in batch mode).
@@ -194,8 +230,12 @@ proc resumeAfterExec*() =
     illwillInit(fullscreen = false)
     showCursor()
     stdout.flushFile()
-    signal(SIGINT, sigIntHandler) # re-arm (C signal() may be one-shot)
-    signal(SIGQUIT, sigQuitHandler)
+    when defined(posix):
+      signal(SIGINT, sigIntHandler) # re-arm (C signal() may be one-shot)
+      signal(SIGQUIT, sigQuitHandler)
+    when defined(windows):
+      enableVT()
+      setControlCHook(winCtrlCHook)
     gMode = mOn
   discard takeCtrlC()
   discard takeSigQuit() # e.g. Ctrl+\ that quit the child, not us
@@ -284,11 +324,118 @@ when defined(posix):
         s.add(chr(b))
       result = (kkText, s)
 
+when defined(windows):
+  const
+    VkBack = 0x08
+    VkTab = 0x09
+    VkReturn = 0x0D
+    VkEscape = 0x1B
+    VkEnd = 0x23
+    VkHome = 0x24
+    VkLeft = 0x25
+    VkUp = 0x26
+    VkRight = 0x27
+    VkDown = 0x28
+    VkDelete = 0x2E
+    LeftAltPressed = 0x0002.DWORD
+    RightAltPressed = 0x0001.DWORD
+    LeftCtrlPressed = 0x0008.DWORD
+    RightCtrlPressed = 0x0004.DWORD
+
+  proc winHasCtrl(state: DWORD): bool =
+    (state and (LeftCtrlPressed or RightCtrlPressed)) != 0.DWORD
+
+  proc winHasAlt(state: DWORD): bool =
+    (state and (LeftAltPressed or RightAltPressed)) != 0.DWORD
+
+  proc readWindowsKey(timeoutMs: int): tuple[kind: KKind, text: string] =
+    ## Native console reader (winlean ReadConsoleInputW). illwill's key
+    ## layer drops Ctrl/Alt modifiers on arrows, so Ctrl+Left etc. would
+    ## collapse to plain arrows; reading INPUT_RECORDs directly preserves
+    ## them for word jumps. Mirrors the POSIX decoder's KKind contract.
+    let hIn = getStdHandle(STD_INPUT_HANDLE)
+    if waitForSingleObject(hIn, int32(timeoutMs)) != WAIT_OBJECT_0:
+      return (kkNone, "")
+    var rec = KEY_EVENT_RECORD()
+    var nRead: cint = 0
+    for _ in 0 ..< 32:
+      if waitForSingleObject(hIn, 0) != WAIT_OBJECT_0:
+        return (kkNone, "")
+      if readConsoleInput(hIn, addr rec, 1, addr nRead) == 0 or nRead == 0:
+        return (kkNone, "")
+      if rec.eventType != 1 or rec.bKeyDown == 0:
+        continue # key release or non-key event (mouse/focus)
+      let vk = int(rec.wVirtualKeyCode)
+      let uch = int(rec.uChar)
+      let state = rec.dwControlKeyState
+      let hasCtrl = winHasCtrl(state)
+      let hasAlt = winHasAlt(state)
+      if hasAlt:
+        # Alt+letter word jumps (console reports the letter + Alt flag);
+        # swallow other Alt combos so they never leak into the buffer.
+        if uch == ord('b') or uch == ord('B'):
+          return (kkWordLeft, "")
+        if uch == ord('f') or uch == ord('F'):
+          return (kkWordRight, "")
+        if vk == VkBack:
+          return (kkAltBackspace, "")
+        if vk == VkLeft:
+          return (kkWordLeft, "")
+        if vk == VkRight:
+          return (kkWordRight, "")
+        if vk == VkUp:
+          return (kkUp, "")
+        if vk == VkDown:
+          return (kkDown, "")
+        return (kkNone, "")
+      if hasCtrl:
+        if vk == VkLeft:
+          return (kkWordLeft, "")
+        if vk == VkRight:
+          return (kkWordRight, "")
+        if vk == VkUp:
+          return (kkUp, "")
+        if vk == VkDown:
+          return (kkDown, "")
+        # Ctrl+letter C0 codes fall through to uch handling below.
+      if uch == 0:
+        case vk:
+        of VkLeft: return (kkLeft, "")
+        of VkRight: return (kkRight, "")
+        of VkUp: return (kkUp, "")
+        of VkDown: return (kkDown, "")
+        of VkHome: return (kkHome, "")
+        of VkEnd: return (kkEnd, "")
+        of VkDelete: return (kkDelete, "")
+        of VkBack: return (kkBackspace, "")
+        of VkTab: return (kkTab, "")
+        of VkReturn: return (kkEnter, "")
+        of VkEscape: return (kkEscape, "")
+        else: return (kkNone, "")
+      else:
+        if uch == 0x1B:
+          return (kkEscape, "")
+        if uch == 26:
+          # Ctrl+Z is the Windows console EOF gesture (Ctrl+D on POSIX).
+          return (kkCtrlD, "")
+        if uch >= 0x20 and uch < 0x7F:
+          return (kkText, $chr(uch))
+        elif uch >= 0x80 and uch <= 0x7FFF:
+          # BMP passthrough (illwill drops these); v1 cursor math still
+          # counts runes as 1 column, same as the POSIX path.
+          return (kkText, $Rune(uch))
+        else:
+          return (c0Kind(uch), "")
+    return (kkNone, "")
+
 proc nextKey*(): tuple[kind: KKind, text: string] =
-  ## One non-blocking input poll (~10ms). POSIX uses the decoder above;
-  ## other platforms fall back to illwill's key layer.
+  ## One non-blocking input poll (~10ms). POSIX uses the tty decoder;
+  ## Windows uses the native console reader; other platforms fall back
+  ## to illwill's key layer.
   when defined(posix):
     readKeys(10)
+  elif defined(windows):
+    readWindowsKey(10)
   else:
     let k = getKey()
     if k == Key.None:

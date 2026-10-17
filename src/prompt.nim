@@ -48,13 +48,15 @@ proc gitInfo(cwd: string): tuple[ok: bool, txt: string, dirty: bool] =
   gGitCacheAt = now
   gGitCacheOk = false
   try:
-    let (branch, code) = execCmdEx("git rev-parse --abbrev-ref HEAD 2>/dev/null")
+    # No shell redirection: execCmdEx captures output, so stderr never
+    # leaks; `2>/dev/null` would break Windows cmd/powershell.
+    let (branch, code) = execCmdEx("git rev-parse --abbrev-ref HEAD")
     if code == 0:
       let b = branch.strip()
       if b.len > 0:
         gGitCacheOk = true
         gGitCacheTxt = b
-        let (st, c2) = execCmdEx("git status --porcelain 2>/dev/null")
+        let (st, c2) = execCmdEx("git status --porcelain")
         gGitCacheDirty = c2 == 0 and st.strip().len > 0
   except OSError:
     discard
@@ -66,23 +68,42 @@ proc shortCwd*(): string =
   if d.startsWith(home):
     d = "~" & d[home.len - 1 .. ^1]
   # keep at most 3 trailing components
-  let parts = d.split('/')
-  if parts.len > 4:
-    d = "…/" & parts[^3 .. ^1].join("/")
+  when defined(windows):
+    let parts = d.split({'/', '\\'})
+    if parts.len > 4:
+      d = "…" & $DirSep & parts[^3 .. ^1].join($DirSep)
+  else:
+    let parts = d.split('/')
+    if parts.len > 4:
+      d = "…/" & parts[^3 .. ^1].join("/")
   d
+
+proc shortHost*(): string =
+  ## Short hostname on POSIX (`hostname -s` equivalent) and Windows
+  ## (`COMPUTERNAME` / `hostname`). Pure except for the one probe.
+  var host = getEnv("HOSTNAME", "")
+  if host.len == 0:
+    host = getEnv("COMPUTERNAME", "")
+  if host.len == 0:
+    try:
+      let (outp, code) = execCmdEx("hostname")
+      if code == 0:
+        host = outp.strip()
+    except OSError:
+      discard
+  if host.len == 0:
+    return "host"
+  let dot = host.find('.')
+  if dot > 0:
+    host[0 ..< dot]
+  else:
+    host
 
 proc buildPrompt*(lastExit: int, powerline = true): Prompt =
   result = Prompt(runs: @[], visibleLen: 0)
   let power = powerline
   let user = getEnv("USER", getEnv("USERNAME", "user"))
-  var host = getEnv("HOSTNAME", "")
-  if host.len == 0:
-    try:
-      host = execCmdEx("hostname -s 2>/dev/null")[0].strip()
-    except OSError:
-      discard
-    if host.len == 0:
-      host = "host"
+  let host = shortHost()
 
   type Seg = tuple[txt: string, fg: ForegroundColor, bg: BackgroundColor,
       bright: bool]

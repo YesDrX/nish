@@ -1,7 +1,7 @@
 # nish
 
 Nim shell: oh-my-posh-like powerline prompt, live history search, everything
-else via `bash -c`.
+else via `bash -c` (Linux) / `powershell -Command` (Windows).
 
 ## Features
 
@@ -16,22 +16,29 @@ else via `bash -c`.
   browsing the same list while any edit resumes filtering). `Up`/`Down`
   on an empty line opens recent history. `Tab` completes the
   current token against filesystem paths / PATH commands (repeat `Tab` to
-  cycle candidates; directories get `/`), `Esc` dismisses.
+  cycle candidates; directories get `/` on Linux, `\` on Windows — both
+  work in PowerShell), `Esc` dismisses.
 - Word jump: `Ctrl+Left/Right`, `Alt+Left/Right`, or `Ctrl+<` / `Ctrl+>`
   move by word (whichever chords your terminal sends; nish decodes C0,
-  CSI and modifyOtherKeys forms). Note `Ctrl+\` shares a byte with `Ctrl+<`
+  CSI and modifyOtherKeys forms on POSIX, native console modifiers on
+  Windows including `Alt+B/F`). Note `Ctrl+\` shares a byte with `Ctrl+<`
   and acts as word-left instead of quitting the shell; children keep
-  normal `Ctrl+\` behavior.
-- Note: commands run via non-interactive `bash -c`, so interactive-shell
+  normal `Ctrl+\` behavior. On Windows `Ctrl+Z` acts as EOF like `Ctrl+D`.
+- Note: commands run via non-interactive `bash -c` (Linux) /
+  `powershell -Command` (Windows), so interactive-shell
   aliases (e.g. `ll`) are not available; use the full command instead.
+  Override with `NISH_SHELL` (`bash`, `powershell`, `pwsh`, `cmd`).
 - 10k ringbuffer history in `~/.nish_history`: loaded once at startup,
   appended during the session (O_APPEND, concurrent-session safe),
   truncated to cap only at startup.
 - TUI via [illwill](https://github.com/johnnovak/illwill) (`fullscreen=false`
   mixed mode: `getKey()` input + `TerminalBuffer` composition + custom
-  cursor-relative blit so shell scrollback keeps working).
-- v1 limits: ASCII input (illwill `getKey` is byte-oriented), single-line
-  editing, no horizontal scroll past terminal width. Windows support last.
+  cursor-relative blit so shell scrollback keeps working). On Windows the
+  editor uses a native console reader (preserves Ctrl/Alt modifiers) and
+  enables VT processing for the ANSI blit, so the same dropdown works in
+  Windows Terminal / conhost PowerShell.
+- v1 limits: ASCII input, single-line editing, no horizontal scroll past
+  terminal width.
 
 ## Build (Debian)
 
@@ -40,6 +47,18 @@ cd /data01/repositories/nish
 nimble install -y   # pulls illwill
 nim c -d:release src/nish.nim -o:nish
 ```
+
+## Build (Windows PowerShell)
+
+```
+cd C:\path\to\nish
+nimble install -y
+nim c -d:release --out:nish.exe src/nish.nim
+.\nish.exe
+```
+
+Default shell is `bash` on Linux, `powershell` on Windows
+(`NISH_SHELL` overrides: `powershell`, `pwsh`, `cmd`, `bash`).
 
 Run tests: `nim c -r tests/t_search.nim`, `nim c -r tests/t_history.nim`.
 Batch mode (non-tty stdin) runs lines without the editor.
@@ -60,7 +79,8 @@ Missing file, broken YAML, or bad values fall back to defaults per key
 
 ## Aliases
 
-`bash -c` is non-interactive, so nish expands the first word itself:
+`bash -c` is non-interactive, so nish expands the first word itself
+(when the shell is bash):
 `~/.bash_aliases` and `~/.bashrc` are scanned per command (always fresh),
 `nish.yaml` `aliases:` overlay them. Only the first unquoted word expands;
 trailing-space values chain (`alias sudo='sudo '`); cycles stop safely;

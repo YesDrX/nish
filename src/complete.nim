@@ -1,9 +1,10 @@
 ## complete.nim - Tab completion for filesystem paths and commands.
 ##
-## - token containing '/' (or in argument position) -> filesystem entries
-##   relative to the typed dir prefix ('~' expanded for reading only);
-##   directories end with '/'. Dotfiles only match a dotted base.
-## - first token without '/' -> executables on PATH + shell builtins.
+## - token containing '/' (or '\\' on Windows, or in argument position) ->
+##   filesystem entries relative to the typed dir prefix ('~' expanded for
+##   reading only); directories end with '/'. Dotfiles only match a dotted
+##   base.
+## - first token without a separator -> executables on PATH + shell builtins.
 ## Candidates are full-token replacements, sorted dirs-first then
 ## alphabetical, capped to keep Tab-cycling sane on huge dirs.
 
@@ -23,11 +24,17 @@ proc sortEntries(names: var seq[tuple[name: string, isDir: bool]]) =
 proc listMatches*(dirRead, base: string): seq[tuple[name: string,
     isDir: bool]] =
   ## Raw (name, isDir) entries of dirRead starting with base.
+  when defined(windows):
+    let baseLow = base.toLowerAscii()
   try:
     for kind, path in walkDir(dirRead):
       let name = lastPathPart(path)
-      if not name.startsWith(base):
-        continue
+      when defined(windows):
+        if not name.toLowerAscii().startsWith(baseLow):
+          continue
+      else:
+        if not name.startsWith(base):
+          continue
       if name.startsWith(".") and not base.startsWith("."):
         continue
       result.add((name, kind in {pcDir, pcLinkToDir}))
@@ -40,21 +47,31 @@ proc listMatches*(dirRead, base: string): seq[tuple[name: string,
 proc expandForRead(dir: string): string =
   if dir == "" or dir == ".":
     "."
-  elif dir == "~" or dir == "~/":
+  elif dir == "~" or dir == "~/" or dir == "~\\":
     getHomeDir()
-  elif dir.startsWith("~/"):
+  elif dir.startsWith("~/") or dir.startsWith("~\\"):
     getHomeDir() & dir[2 .. ^1]
   else:
     dir
 
+proc lastSepPos(token: string): int =
+  ## Index of the last path separator, or -1. Windows accepts both
+  ## '/' (AltSep, also works in PowerShell) and '\\' (DirSep).
+  when defined(windows):
+    max(token.rfind('/'), token.rfind('\\'))
+  else:
+    token.rfind('/')
+
 proc pathCandidates*(token: string): seq[string] =
   ## Full-token replacements; the typed dir prefix is preserved.
+  ## Directories end with DirSep ('/' on POSIX, '\\' on Windows; both
+  ## work in PowerShell).
   var dirPart, base: string
   if token == "~":
-    dirPart = "~/"
+    dirPart = "~" & $DirSep
     base = ""
   else:
-    let slash = token.rfind('/')
+    let slash = lastSepPos(token)
     if slash < 0:
       dirPart = ""
       base = token
@@ -64,7 +81,7 @@ proc pathCandidates*(token: string): seq[string] =
   let dirRead = if dirPart == "": "." else: expandForRead(dirPart)
   for (name, isDir) in listMatches(dirRead, base):
     if isDir:
-      result.add(dirPart & name & "/")
+      result.add(dirPart & name & $DirSep)
     else:
       result.add(dirPart & name)
 
@@ -72,40 +89,77 @@ proc commandCandidates*(token: string, pathEnv = ""): seq[string] =
   ## Executable names on PATH + builtins starting with token.
   let pe = if pathEnv == "": getEnv("PATH", "") else: pathEnv
   var seen = initHashSet[string]()
-  for b in Builtins:
-    if b.startsWith(token) and b notin seen:
-      seen.incl(b)
-      result.add(b)
-  for d in pe.split(':'):
-    if d == "":
-      continue
-    try:
-      for kind, path in walkDir(d):
-        if kind == pcDir:
-          continue
-        let name = lastPathPart(path)
-        if name in seen or not name.startsWith(token):
-          continue
-        try:
-          let perms = getFilePermissions(path)
-          if fpUserExec in perms or fpGroupExec in perms or
-              fpOthersExec in perms:
-            seen.incl(name)
+  when defined(windows):
+    let tokLow = token.toLowerAscii()
+    for b in Builtins:
+      if b.toLowerAscii().startsWith(tokLow) and b notin seen:
+        seen.incl(b)
+        result.add(b)
+    # Windows has no exec bits; executability is by extension (PATHEXT).
+    var exts: seq[string] = @[]
+    for e in getEnv("PATHEXT", ".COM;.EXE;.BAT;.CMD;.PS1").split(';'):
+      let t = e.strip().toLowerAscii()
+      if t.len > 0:
+        exts.add(t)
+    for d0 in pe.split(PathSep):
+      let d = d0.strip().strip(chars = {'"', '\''})
+      if d == "":
+        continue
+      try:
+        for kind, path in walkDir(d):
+          if kind == pcDir:
+            continue
+          let name = lastPathPart(path)
+          if name.toLowerAscii() in seen or
+              not name.toLowerAscii().startsWith(tokLow):
+            continue
+          let ext = splitFile(name).ext.toLowerAscii()
+          if ext in exts:
+            seen.incl(name.toLowerAscii())
             result.add(name)
-        except OSError:
-          discard
-    except OSError:
-      discard
+      except OSError:
+        discard
+  else:
+    for b in Builtins:
+      if b.startsWith(token) and b notin seen:
+        seen.incl(b)
+        result.add(b)
+    for d in pe.split(PathSep):
+      if d == "":
+        continue
+      try:
+        for kind, path in walkDir(d):
+          if kind == pcDir:
+            continue
+          let name = lastPathPart(path)
+          if name in seen or not name.startsWith(token):
+            continue
+          try:
+            let perms = getFilePermissions(path)
+            if fpUserExec in perms or fpGroupExec in perms or
+                fpOthersExec in perms:
+              seen.incl(name)
+              result.add(name)
+          except OSError:
+            discard
+      except OSError:
+        discard
   result.sort(cmp)
   if result.len > MaxCandidates:
     result.setLen(MaxCandidates)
 
 proc completeCandidates*(token: string, firstToken: bool,
     pathEnv = ""): seq[string] =
-  if '/' in token or not firstToken:
-    pathCandidates(token)
+  when defined(windows):
+    if '/' in token or '\\' in token or not firstToken:
+      pathCandidates(token)
+    else:
+      commandCandidates(token, pathEnv)
   else:
-    commandCandidates(token, pathEnv)
+    if '/' in token or not firstToken:
+      pathCandidates(token)
+    else:
+      commandCandidates(token, pathEnv)
 
 proc isCommandPosition*(buf: string, tokStart: int): bool =
   ## True when the token at tokStart is in command position: start of line

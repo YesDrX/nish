@@ -1,6 +1,7 @@
 ## nish - nim shell.
 ## Colored powerline prompt, live history search dropdown (illwill),
-## 10k ringbuffer history, everything else via bash.
+## 10k ringbuffer history, everything else via bash (POSIX) / powershell
+## (Windows).
 
 import terminal, os, strutils
 import prompt, history, editor, exec, config
