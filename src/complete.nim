@@ -3,8 +3,9 @@
 ## - token containing '/' (or '\\' on Windows, or in argument position) ->
 ##   filesystem entries relative to the typed dir prefix ('~' expanded for
 ##   reading only); directories end with '/'. Dotfiles only match a dotted
-##   base.
-## - first token without a separator -> executables on PATH + shell builtins.
+##   base. Matching is case-insensitive; replacements keep the on-disk case.
+## - first token without a separator -> executables on PATH + shell builtins
+##   (also case-insensitive).
 ## Candidates are full-token replacements, sorted dirs-first then
 ## alphabetical, capped to keep Tab-cycling sane on huge dirs.
 
@@ -23,18 +24,14 @@ proc sortEntries(names: var seq[tuple[name: string, isDir: bool]]) =
 
 proc listMatches*(dirRead, base: string): seq[tuple[name: string,
     isDir: bool]] =
-  ## Raw (name, isDir) entries of dirRead starting with base.
-  when defined(windows):
-    let baseLow = base.toLowerAscii()
+  ## Raw (name, isDir) entries of dirRead starting with base
+  ## (case-insensitive; replacements keep the on-disk case).
+  let baseLow = base.toLowerAscii()
   try:
     for kind, path in walkDir(dirRead):
       let name = lastPathPart(path)
-      when defined(windows):
-        if not name.toLowerAscii().startsWith(baseLow):
-          continue
-      else:
-        if not name.startsWith(base):
-          continue
+      if not name.toLowerAscii().startsWith(baseLow):
+        continue
       if name.startsWith(".") and not base.startsWith("."):
         continue
       result.add((name, kind in {pcDir, pcLinkToDir}))
@@ -86,7 +83,8 @@ proc pathCandidates*(token: string): seq[string] =
       result.add(dirPart & name)
 
 proc commandCandidates*(token: string, pathEnv = ""): seq[string] =
-  ## Executable names on PATH + builtins starting with token.
+  ## Executable names on PATH + builtins starting with token
+  ## (case-insensitive; replacements keep the on-disk case).
   let pe = if pathEnv == "": getEnv("PATH", "") else: pathEnv
   var seen = initHashSet[string]()
   when defined(windows):
@@ -120,8 +118,9 @@ proc commandCandidates*(token: string, pathEnv = ""): seq[string] =
       except OSError:
         discard
   else:
+    let tokLow = token.toLowerAscii()
     for b in Builtins:
-      if b.startsWith(token) and b notin seen:
+      if b.startsWith(tokLow) and b notin seen:
         seen.incl(b)
         result.add(b)
     for d in pe.split(PathSep):
@@ -132,7 +131,7 @@ proc commandCandidates*(token: string, pathEnv = ""): seq[string] =
           if kind == pcDir:
             continue
           let name = lastPathPart(path)
-          if name in seen or not name.startsWith(token):
+          if name in seen or not name.toLowerAscii().startsWith(tokLow):
             continue
           try:
             let perms = getFilePermissions(path)

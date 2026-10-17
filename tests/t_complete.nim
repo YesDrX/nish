@@ -8,6 +8,7 @@ writeFile(tree / "alpha.txt", "x")
 writeFile(tree / "beta", "x")
 writeFile(tree / ".hidden", "x")
 writeFile(tree / "alpine" / "inner.txt", "x")
+writeFile(tree / "alpine" / "MiXeD.txt", "x")
 let bin = base / "bin"
 createDir(bin)
 when defined(windows):
@@ -29,6 +30,14 @@ block:
 block:
   let c = pathCandidates(tree / "alpine")
   assert c == @[tree / "alpine/"], "got " & $c
+
+# matching is case-insensitive, replacements keep on-disk case
+block:
+  assert pathCandidates(tree / "AL") ==
+    @[tree / "alpine/", tree / "alpha.txt"], "got " & $(pathCandidates(tree / "AL"))
+  let sub = tree / "alpine"
+  assert pathCandidates(sub / "mix") == @[sub / "MiXeD.txt"]
+  assert pathCandidates(sub / "MIX") == @[sub / "MiXeD.txt"]
 
 # dotfiles only on dotted base
 block:
@@ -52,17 +61,21 @@ block:
 block:
   assert pathCandidates(tree / "zzz-nope") == @[]
 
-# commands: PATH exes + builtins, non-exec excluded
+# commands: PATH exes + builtins, non-exec excluded (case-insensitive)
 block:
   when defined(windows):
     let c = commandCandidates("m", bin)
     assert "mycmd.exe" in c, "got " & $c
     assert "readme.txt" notin c
+    assert commandCandidates("M", bin) == @["mycmd.exe"]
   else:
     let c = commandCandidates("m", bin)
     assert "mycmd" in c, "got " & $c
     assert "readme" notin c
+    assert commandCandidates("M", bin) == @["mycmd"], "got " &
+      $commandCandidates("M", bin)
   assert "history" in commandCandidates("hi", bin)
+  assert "history" in commandCandidates("HI", bin)
 
 # dispatch
 block:

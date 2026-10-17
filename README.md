@@ -16,8 +16,8 @@ else via `bash -c` (Linux) / `powershell -Command` (Windows).
   browsing the same list while any edit resumes filtering). `Up`/`Down`
   on an empty line opens recent history. `Tab` completes the
   current token against filesystem paths / PATH commands (repeat `Tab` to
-  cycle candidates; directories get `/` on Linux, `\` on Windows — both
-  work in PowerShell), `Esc` dismisses.
+  cycle candidates; case-insensitive, directories get `/` on Linux, `\`
+  on Windows — both work in PowerShell), `Esc` dismisses.
 - Word jump: `Ctrl+Left/Right`, `Alt+Left/Right`, or `Ctrl+<` / `Ctrl+>`
   move by word (whichever chords your terminal sends; nish decodes C0,
   CSI and modifyOtherKeys forms on POSIX, native console modifiers on
