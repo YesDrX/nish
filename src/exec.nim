@@ -7,8 +7,44 @@
 ## export/unset, history, clear, help. First-word aliases (bash files +
 ## nish.yaml) expand before dispatch, so `alias ll='ls -l'` keeps working.
 
-import os, osproc, strutils, tables
+import os, osproc, strutils, tables, sets
 import history, editor, config, alias
+
+var gValidLocales: HashSet[string]
+var gLocalesProbed = false
+
+proc normLocale(s: string): string =
+  ## glibc normalizes locale names by lowercasing and dropping '-'
+  ## (`en_US.UTF-8` == `en_US.utf8`); mirror that for the comparison.
+  for c in s.toLowerAscii():
+    if c != '-':
+      result.add(c)
+
+proc sanitizeLocaleEnv() =
+  ## Drop LANG / LC_* vars naming unavailable locales. Otherwise every
+  ## `bash -c` child prints `warning: setlocale: ... cannot change locale`
+  ## (ssh clients forward these vars, and the target often lacks them).
+  ## Unsetting is behavior-identical: after the failed setlocale the child
+  ## runs in the C locale anyway. Probed once per process; per-spawn cost
+  ## is one env scan, so mid-session `export LC_ALL=...` is covered too.
+  when defined(posix):
+    if not gLocalesProbed:
+      gLocalesProbed = true
+      try:
+        let (outp, code) = execCmdEx("locale -a")
+        if code == 0:
+          for line in outp.splitLines():
+            let t = line.strip()
+            if t.len > 0:
+              gValidLocales.incl(normLocale(t))
+      except OSError:
+        discard
+    if gValidLocales.len == 0:
+      return # cannot verify: touch nothing
+    for key, val in envPairs():
+      if key == "LANG" or key.startsWith("LC_"):
+        if val.len > 0 and normLocale(val) notin gValidLocales:
+          delEnv(key)
 
 proc shellName*(): string =
   when defined(windows):
@@ -27,6 +63,7 @@ proc runPassthrough*(line: string): int =
   ## Run via the configured shell with inherited stdio. Restores cooked
   ## mode around it. POSIX: `bash -c`; Windows PowerShell:
   ## `powershell -NoLogo -NoProfile -Command`; cmd: `cmd /c`.
+  sanitizeLocaleEnv()
   suspendForExec()
   let shell = shellName()
   let base = shellBase()
