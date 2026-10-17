@@ -260,7 +260,7 @@ when defined(posix):
   proc stdinReady(timeoutMs: int): bool =
     var tv: Timeval
     tv.tv_sec = Time(timeoutMs div 1000)
-    tv.tv_usec = (timeoutMs mod 1000) * 1000
+    tv.tv_usec = 1000 * int32(timeoutMs mod 1000) # int32 because of macos
     var fds: TFdSet
     FD_ZERO(fds)
     FD_SET(STDIN_FILENO, fds)
