@@ -1,14 +1,15 @@
 ## search.nim - fast in-memory history ranking.
 ##
 ## 10k entries need no index structure (trie/BK-tree overkill): a single
-## linear scan with early-exit scoring is ~1ms in Nim. Lowercase candidates
-## are precomputed once at history load; the query is lowered once per
-## keystroke. Results are most-recent-first, deduped (newest wins).
+## linear scan with early-exit scoring plus a bounded top-k selection is
+## well under 1ms in release builds. Lowercase candidates are precomputed
+## once at history load; the query is lowered once per keystroke. Results
+## are most-recent-first, deduped (newest wins).
 ##
 ## Ranking: prefix match > substring match (earlier pos wins) >
 ## subsequence-fuzzy match (fewer gaps wins).
 
-import strutils, algorithm, sets
+import strutils, sets
 import history
 
 proc matchScore*(query, candLower: string): int =
@@ -38,27 +39,45 @@ proc matchScore*(query, candLower: string): int =
 
 proc filterHistory*(h: History, query: string, limit = 6): seq[string] =
   ## Top `limit` suggestions for `query`, most-recent-first, deduped.
+  ## Single newest-to-oldest pass with a bounded top-k list: identical
+  ## results to scoring all + full sort + newest-wins dedup, but O(n*limit)
+  ## with no per-keystroke sort or large temp allocations.
   let q = query.toLowerAscii()
-  if q.len == 0:
-    var seen = initHashSet[string]()
-    for i in countdown(h.items.high, 0):
-      if h.items[i] notin seen:
-        seen.incl(h.items[i])
-        result.add(h.items[i])
-        if result.len >= limit:
-          break
+  if q.len == 0 or limit <= 0:
+    if q.len == 0 and limit > 0:
+      var seen = initHashSet[string]()
+      for i in countdown(h.items.high, 0):
+        if h.items[i] notin seen:
+          seen.incl(h.items[i])
+          result.add(h.items[i])
+          if result.len >= limit:
+            break
     return
-  var scored: seq[(int, int)] = @[]
-  for i in 0 ..< h.items.len:
+  var bestScores: seq[int] = @[] # desc; parallel to bestIdx
+  var bestIdx: seq[int] = @[]
+  var inBest = initHashSet[string]() # strings currently selected (<= limit)
+  for i in countdown(h.items.high, 0):
     let sc = matchScore(q, h.lower[i])
-    if sc >= 0:
-      scored.add((sc, i))
-  scored.sort(proc(a, b: (int, int)): int =
-    if a[0] != b[0]: cmp(b[0], a[0]) else: cmp(b[1], a[1]))
-  var seen = initHashSet[string]()
-  for (_, i) in scored:
-    if h.items[i] notin seen:
-      seen.incl(h.items[i])
-      result.add(h.items[i])
-      if result.len >= limit:
-        break
+    if sc < 0:
+      continue
+    if bestScores.len >= limit and sc <= bestScores[^1]:
+      # Best is full and the newcomer ranks at/below the minimum:
+      # equal scores keep their higher indices first (we scan newest to
+      # oldest), so it would land last and be evicted — skip hashing.
+      continue
+    let s = h.items[i]
+    if s in inBest:
+      continue # newest occurrence already selected
+    # Insert after all equal scores (older indices rank lower).
+    var pos = 0
+    while pos < bestScores.len and bestScores[pos] >= sc:
+      inc pos
+    bestScores.insert(sc, pos)
+    bestIdx.insert(i, pos)
+    inBest.incl(s)
+    if bestScores.len > limit:
+      inBest.excl(h.items[bestIdx[^1]])
+      bestScores.setLen(limit)
+      bestIdx.setLen(limit)
+  for i in bestIdx:
+    result.add(h.items[i])

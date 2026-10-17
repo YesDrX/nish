@@ -78,9 +78,15 @@ proc shortCwd*(): string =
       d = "…/" & parts[^3 .. ^1].join("/")
   d
 
+var gHostCache = ""
+
 proc shortHost*(): string =
   ## Short hostname on POSIX (`hostname -s` equivalent) and Windows
-  ## (`COMPUTERNAME` / `hostname`). Pure except for the one probe.
+  ## (`COMPUTERNAME` / `hostname`). The result is cached: it cannot change
+  ## during the process lifetime, and the `hostname` probe spawns a
+  ## subprocess (~5ms) that would otherwise run on every prompt.
+  if gHostCache.len > 0:
+    return gHostCache
   var host = getEnv("HOSTNAME", "")
   if host.len == 0:
     host = getEnv("COMPUTERNAME", "")
@@ -92,12 +98,12 @@ proc shortHost*(): string =
     except OSError:
       discard
   if host.len == 0:
-    return "host"
+    host = "host"
   let dot = host.find('.')
   if dot > 0:
-    host[0 ..< dot]
-  else:
-    host
+    host = host[0 ..< dot]
+  gHostCache = host
+  host
 
 proc buildPrompt*(lastExit: int, powerline = true): Prompt =
   result = Prompt(runs: @[], visibleLen: 0)

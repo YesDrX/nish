@@ -103,8 +103,8 @@ proc commandCandidates*(token: string, pathEnv = ""): seq[string] =
         exts.add(t)
     for d0 in pe.split(PathSep):
       let d = d0.strip().strip(chars = {'"', '\''})
-      if d == "":
-        continue
+      if d == "" or not dirExists(d):
+        continue # skip missing entries without exception overhead
       try:
         for kind, path in walkDir(d):
           if kind == pcDir:
@@ -125,8 +125,8 @@ proc commandCandidates*(token: string, pathEnv = ""): seq[string] =
         seen.incl(b)
         result.add(b)
     for d in pe.split(PathSep):
-      if d == "":
-        continue
+      if d == "" or not dirExists(d):
+        continue # skip missing entries without exception overhead
       try:
         for kind, path in walkDir(d):
           if kind == pcDir:
