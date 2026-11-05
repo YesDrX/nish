@@ -555,6 +555,52 @@ proc truncateVis*(s: string, maxRunes: int): string =
     result.add($r)
     inc n
 
+proc runeCursorAt*(buf: string, byteCursor: int): int =
+  ## Display column (in runes, 1 col per rune per v1) of a byte cursor.
+  ## Walks whole runes so a mid-rune byte index lands on the rune start.
+  ## Pure, unit-tested.
+  let c = max(0, min(byteCursor, buf.len))
+  var b = 0
+  result = 0
+  for ru in buf.runes:
+    let rl = ($ru).len
+    if b + rl > c:
+      break
+    b += rl
+    inc result
+
+proc sliceRunes*(s: string, a, b: int): string =
+  ## Substring of runes [a, b). Pure, unit-tested. Out-of-range clamps.
+  if b <= a:
+    return ""
+  let lo = max(a, 0)
+  var idx = 0
+  for ru in s.runes:
+    if idx >= lo and idx < b:
+      result.add($ru)
+    inc idx
+    if idx >= b:
+      break
+
+proc clampScroll*(offset, cursorAbs, totalRunes, width: int): int =
+  ## Next horizontal offset for a single-line viewport of `width` cols
+  ## showing global rune window [offset, offset+width) of a `totalRunes`
+  ## line, with the cursor at `cursorAbs` (insertion point, 0..totalRunes).
+  ## Keeps the previous offset when the cursor is already visible (stable
+  ## viewport while moving inside the window), otherwise scrolls minimally.
+  ## Pure, unit-tested.
+  if width <= 0:
+    return 0
+  if totalRunes + 1 <= width:
+    return 0
+  let maxOff = totalRunes - width + 1
+  var off = max(0, min(offset, maxOff))
+  if cursorAbs < off:
+    off = cursorAbs
+  elif cursorAbs >= off + width:
+    off = cursorAbs - width + 1
+  max(0, min(off, maxOff))
+
 proc blit(tb: TerminalBuffer, nrows, cursorCol: int) =
   ## Draw tb (1 input row + nrows suggestion rows) at the cursor line,
   ## then restore the cursor onto the input row at cursorCol.
@@ -610,11 +656,26 @@ proc blit(tb: TerminalBuffer, nrows, cursorCol: int) =
 
 proc finalizeLine(pr: Prompt, buf: string, marker = "") =
   ## Leave `prompt+buf` on screen, clear the dropdown, go to a fresh line.
-  let endCol = pr.visibleLen + buf.len
-  stdout.write("\e[0m\r")
-  if endCol > 0:
-    stdout.write("\e[" & $endCol & "C")
-  stdout.write("\e[J")
+  ## The input row shows a scrolled viewport when the line exceeds the
+  ## terminal width, so re-emit the full prompt+buf here (allowing natural
+  ## wrap) instead of just moving the cursor: otherwise the tail would stay
+  ## truncated on screen.
+  stdout.write("\e[0m\r\e[J") # clear viewport row + suggestion rows below
+  for r in pr.runs:
+    var codes: seq[string] = @[]
+    if r.bright:
+      codes.add("1")
+    if r.fg != fgNone:
+      codes.add($ord(r.fg))
+    if r.bg != bgNone:
+      codes.add($ord(r.bg))
+    if codes.len == 0:
+      stdout.write("\e[0m")
+    else:
+      stdout.write("\e[0;" & codes.join(";") & "m")
+    stdout.write(r.text)
+  stdout.write("\e[0m")
+  stdout.write(buf)
   if marker.len > 0:
     stdout.write(marker)
   stdout.write("\n")
@@ -632,6 +693,9 @@ proc readLine*(pr: Prompt, hist: History, cfg: Config): LineResult =
   var navActive = false
   var navQuery = ""
   var tab = TabState()
+  ## Horizontal scroll for long lines: global rune window
+  ## [offset, offset+w) of prompt+buf kept so the cursor stays visible.
+  var offset = 0
   ## Tab validity is self-invalidating: a cycle continues only while the
   ## buffer and cursor are exactly as the last Tab left them, so plain
   ## edits need no explicit reset.
@@ -655,13 +719,30 @@ proc readLine*(pr: Prompt, hist: History, cfg: Config): LineResult =
     elif sel >= sug.len:
       sel = sug.len - 1
     let w = max(terminalWidth(), 20)
+    # Horizontal viewport: keep the cursor visible when prompt+buf
+    # exceeds the terminal width (Home shows the start, End the tail,
+    # typing at the end shifts the line left).
+    let bufRunes = buf.runeLen
+    let rcursor = runeCursorAt(buf, cursor)
+    let cursorAbs = pr.visibleLen + rcursor
+    let totalRunes = pr.visibleLen + bufRunes
+    offset = clampScroll(offset, cursorAbs, totalRunes, w)
     var tb = newTerminalBuffer(w, 1 + sug.len)
+    var gPos = 0
     for r in pr.runs:
-      tb.setForegroundColor(r.fg, bright = r.bright)
-      tb.setBackgroundColor(r.bg)
-      tb.write(r.text)
-    tb.resetAttributes()
-    tb.write(buf)
+      let rLen = r.text.runeLen
+      let vs = max(gPos, offset)
+      let ve = min(gPos + rLen, offset + w)
+      if vs < ve:
+        tb.setForegroundColor(r.fg, bright = r.bright)
+        tb.setBackgroundColor(r.bg)
+        tb.write(sliceRunes(r.text, vs - gPos, ve - gPos))
+      gPos += rLen
+    let bvs = max(gPos, offset)
+    let bve = min(gPos + bufRunes, offset + w)
+    if bvs < bve:
+      tb.resetAttributes()
+      tb.write(sliceRunes(buf, bvs - gPos, bve - gPos))
     for i, s in sug:
       let row = i + 1
       let marker = if i == sel: "> " else: "  "
@@ -678,7 +759,7 @@ proc readLine*(pr: Prompt, hist: History, cfg: Config): LineResult =
         tb.setForegroundColor(fgCyan)
         tb.write(0, row, marker & truncateVis(s, w - marker.runeLen))
     tb.resetAttributes()
-    blit(tb, sug.len, pr.visibleLen + cursor)
+    blit(tb, sug.len, cursorAbs - offset)
 
   proc goWordLeft() =
     let i = wordLeftFrom(buf, cursor)
