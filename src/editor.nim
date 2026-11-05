@@ -4,8 +4,9 @@
 ## - illwillInit(fullscreen=false) / illwillDeinit() for terminal setup
 ##   (non-canonical input, cross-platform key layer, SIGTSTP handling)
 ## - getKey() polling for all input incl. arrows / Home / End / Delete
-## - TerminalBuffer as the composition surface: prompt runs + input line +
-##   suggestion rows are composed with tb.write / colors, then blitted.
+## - direct ANSI blit: the full prompt+input logical line is written out and
+##   the terminal soft-wraps it across physical rows, with suggestion rows
+##   below; the cursor is restored via cursor-up + carriage-return moves.
 ##
 ## Why a custom blit instead of tb.display()? display() writes at absolute
 ## screen coordinates (fullscreen model). A shell scrolls: the prompt lives
@@ -569,82 +570,70 @@ proc runeCursorAt*(buf: string, byteCursor: int): int =
     b += rl
     inc result
 
-proc sliceRunes*(s: string, a, b: int): string =
-  ## Substring of runes [a, b). Pure, unit-tested. Out-of-range clamps.
-  if b <= a:
-    return ""
-  let lo = max(a, 0)
-  var idx = 0
-  for ru in s.runes:
-    if idx >= lo and idx < b:
-      result.add($ru)
-    inc idx
-    if idx >= b:
-      break
-
-proc clampScroll*(offset, cursorAbs, totalRunes, width: int): int =
-  ## Next horizontal offset for a single-line viewport of `width` cols
-  ## showing global rune window [offset, offset+width) of a `totalRunes`
-  ## line, with the cursor at `cursorAbs` (insertion point, 0..totalRunes).
-  ## Keeps the previous offset when the cursor is already visible (stable
-  ## viewport while moving inside the window), otherwise scrolls minimally.
-  ## Pure, unit-tested.
+proc wrapRows*(totalRunes, width: int): int =
+  ## Physical rows a `totalRunes` logical line occupies on a `width` terminal
+  ## via soft-wrap (at least 1). Pure, unit-tested.
   if width <= 0:
-    return 0
-  if totalRunes + 1 <= width:
-    return 0
-  let maxOff = totalRunes - width + 1
-  var off = max(0, min(offset, maxOff))
-  if cursorAbs < off:
-    off = cursorAbs
-  elif cursorAbs >= off + width:
-    off = cursorAbs - width + 1
-  max(0, min(off, maxOff))
+    return 1
+  max(1, (totalRunes + width - 1) div width)
 
-proc blit(tb: TerminalBuffer, nrows, cursorCol: int) =
-  ## Draw tb (1 input row + nrows suggestion rows) at the cursor line,
-  ## then restore the cursor onto the input row at cursorCol.
+proc cursorWrapPos*(cursorAbs, width: int): tuple[row, col: int] =
+  ## Physical (row, col) of a logical `cursorAbs` offset on a `width`
+  ## terminal. Pure, unit-tested.
+  if width <= 0:
+    return (0, 0)
+  (cursorAbs div width, cursorAbs mod width)
+
+proc blitWrapped(pr: Prompt, buf: string, w, totalRunes, cursorRow,
+    cursorCol, k: int, upLines: int, sug: seq[string], sel: int) =
+  ## Soft-wrap blit: write prompt+buf as one logical line and let the
+  ## terminal wrap it across `k` physical rows (easy mouse select/copy as
+  ## a single line), with hard-line suggestion rows below. Then restore the
+  ## cursor to (`cursorRow`, `cursorCol`) inside the wrapped input.
+  ## `upLines` is the previous cursor row (distance back to the top of the
+  ## old block) so redraw starts from a clean slate.
   ## NOTE: \e[K / \e[J erase using the *current* background color, so attrs
   ## are always reset to default before any erase - otherwise a highlight
   ## row's bg bleeds onto neighbouring rows.
   hideCursor()
-  stdout.write("\e[0m\r\e[J") # default attrs, line start, clear old dropdown
-  for y in 0 ..< tb.height:
-    var cur = ""
-    if y > 0:
-      stdout.write("\e[0m\n\e[K")
-    # trim trailing blank cells so we never pad-wrap
-    var rowEnd = -1
-    for x in 0 ..< tb.width:
-      let c = tb[x, y]
-      if c.ch != " ".runeAt(0) or c.fg != fgNone or c.bg != bgNone or
-          c.style != {}:
-        rowEnd = x
-    if rowEnd < 0:
-      continue
-    for x in 0 .. rowEnd:
-      let c = tb[x, y]
-      # attribute signature for this cell
-      var sig = $ord(c.fg) & "/" & $ord(c.bg) & "/"
-      for st in c.style:
-        sig.add($ord(st) & ",")
-      if sig != cur:
-        cur = sig
-        var parts: seq[string] = @[]
-        for st in c.style:
-          parts.add($ord(st))
-        if c.fg != fgNone:
-          parts.add($ord(c.fg))
-        if c.bg != bgNone:
-          parts.add($ord(c.bg))
-        if parts.len == 0:
-          stdout.write("\e[0m")
-        else:
-          stdout.write("\e[0;" & parts.join(";") & "m")
-      stdout.write($c.ch)
+  if upLines > 0:
+    stdout.write("\e[" & $upLines & "A")
+  stdout.write("\e[0m\r\e[J") # default attrs, top of block, clear old block
+  for r in pr.runs:
+    var codes: seq[string] = @[]
+    if r.bright:
+      codes.add("1")
+    if r.fg != fgNone:
+      codes.add($ord(r.fg))
+    if r.bg != bgNone:
+      codes.add($ord(r.bg))
+    if codes.len == 0:
+      stdout.write("\e[0m")
+    else:
+      stdout.write("\e[0;" & codes.join(";") & "m")
+    stdout.write(r.text)
+  stdout.write("\e[0;37m")
+  stdout.write(buf)
+  let ceilRows = max(1, (totalRunes + w - 1) div w)
+  if k > ceilRows:
+    # cursor sits on a fresh blank row past exactly-filled content
+    # (total is an exact multiple of w): force that row so counts match
+    stdout.write("\n\e[0m\e[K")
+  for i, s in sug:
+    stdout.write("\e[0m\n\e[K")
+    let marker = if i == sel: "> " else: "  "
+    let disp = truncateVis(s, w - marker.runeLen)
+    if i == sel:
+      # compact highlight: only the text itself, never padded to full
+      # width (a full-width bar looks broken on dark terminals)
+      stdout.write("\e[0;1;37;44m" & marker & disp & "\e[0m")
+    else:
+      stdout.write("\e[0;36m" & marker & disp & "\e[0m")
   stdout.write("\e[0m")
-  if nrows > 0:
-    stdout.write("\e[" & $nrows & "A")
+  let totalRows = k + sug.len
+  let up = (totalRows - 1) - cursorRow
+  if up > 0:
+    stdout.write("\e[" & $up & "A")
   stdout.write("\r")
   if cursorCol > 0:
     stdout.write("\e[" & $cursorCol & "C")
@@ -654,13 +643,14 @@ proc blit(tb: TerminalBuffer, nrows, cursorCol: int) =
   showCursor()
   stdout.flushFile()
 
-proc finalizeLine(pr: Prompt, buf: string, marker = "") =
+proc finalizeLine(pr: Prompt, buf: string, marker = "", upLines = 0) =
   ## Leave `prompt+buf` on screen, clear the dropdown, go to a fresh line.
-  ## The input row shows a scrolled viewport when the line exceeds the
-  ## terminal width, so re-emit the full prompt+buf here (allowing natural
-  ## wrap) instead of just moving the cursor: otherwise the tail would stay
-  ## truncated on screen.
-  stdout.write("\e[0m\r\e[J") # clear viewport row + suggestion rows below
+  ## The input wraps across physical rows, so first return to the top of
+  ## the block (`upLines`) before clearing; then re-emit the full line and
+  ## let the terminal soft-wrap it naturally.
+  if upLines > 0:
+    stdout.write("\e[" & $upLines & "A")
+  stdout.write("\e[0m\r\e[J") # clear wrapped block + suggestion rows below
   for r in pr.runs:
     var codes: seq[string] = @[]
     if r.bright:
@@ -693,9 +683,10 @@ proc readLine*(pr: Prompt, hist: History, cfg: Config): LineResult =
   var navActive = false
   var navQuery = ""
   var tab = TabState()
-  ## Horizontal scroll for long lines: global rune window
-  ## [offset, offset+w) of prompt+buf kept so the cursor stays visible.
-  var offset = 0
+  ## Wrapped input: the prompt+buf logical line soft-wraps across physical
+  ## rows. `prevCursorRow` is the cursor's physical row in the previous
+  ## frame, so the next blit can climb back to the top of the block.
+  var prevCursorRow = 0
   ## Tab validity is self-invalidating: a cycle continues only while the
   ## buffer and cursor are exactly as the last Tab left them, so plain
   ## edits need no explicit reset.
@@ -719,47 +710,20 @@ proc readLine*(pr: Prompt, hist: History, cfg: Config): LineResult =
     elif sel >= sug.len:
       sel = sug.len - 1
     let w = max(terminalWidth(), 20)
-    # Horizontal viewport: keep the cursor visible when prompt+buf
-    # exceeds the terminal width (Home shows the start, End the tail,
-    # typing at the end shifts the line left).
+    # Multiline: the full prompt+buf logical line is written out and the
+    # terminal soft-wraps it (Home/End/arrows just move the logical cursor;
+    # the tail wraps onto the next physical row and stays selectable).
     let bufRunes = buf.runeLen
     let rcursor = runeCursorAt(buf, cursor)
     let cursorAbs = pr.visibleLen + rcursor
     let totalRunes = pr.visibleLen + bufRunes
-    offset = clampScroll(offset, cursorAbs, totalRunes, w)
-    var tb = newTerminalBuffer(w, 1 + sug.len)
-    var gPos = 0
-    for r in pr.runs:
-      let rLen = r.text.runeLen
-      let vs = max(gPos, offset)
-      let ve = min(gPos + rLen, offset + w)
-      if vs < ve:
-        tb.setForegroundColor(r.fg, bright = r.bright)
-        tb.setBackgroundColor(r.bg)
-        tb.write(sliceRunes(r.text, vs - gPos, ve - gPos))
-      gPos += rLen
-    let bvs = max(gPos, offset)
-    let bve = min(gPos + bufRunes, offset + w)
-    if bvs < bve:
-      tb.resetAttributes()
-      tb.write(sliceRunes(buf, bvs - gPos, bve - gPos))
-    for i, s in sug:
-      let row = i + 1
-      let marker = if i == sel: "> " else: "  "
-      if i == sel:
-        # compact highlight: only the text itself, never padded to full
-        # width (a full-width bar looks broken on dark terminals)
-        tb.setBackgroundColor(bgBlue)
-        tb.setForegroundColor(fgWhite, bright = true)
-        let disp = truncateVis(s, w - marker.runeLen)
-        tb.write(0, row, marker & disp)
-        tb.resetAttributes()
-      else:
-        tb.resetAttributes()
-        tb.setForegroundColor(fgCyan)
-        tb.write(0, row, marker & truncateVis(s, w - marker.runeLen))
-    tb.resetAttributes()
-    blit(tb, sug.len, cursorAbs - offset)
+    let (cursorRow, cursorCol) = cursorWrapPos(cursorAbs, w)
+    var k = wrapRows(totalRunes, w)
+    if cursorRow >= k:
+      k = cursorRow + 1
+    blitWrapped(pr, buf, w, totalRunes, cursorRow, cursorCol, k,
+      prevCursorRow, sug, sel)
+    prevCursorRow = cursorRow
 
   proc goWordLeft() =
     let i = wordLeftFrom(buf, cursor)
@@ -776,7 +740,7 @@ proc readLine*(pr: Prompt, hist: History, cfg: Config): LineResult =
   render()
   while true:
     if takeCtrlC():
-      finalizeLine(pr, buf, "^C")
+      finalizeLine(pr, buf, "^C", prevCursorRow)
       return LineResult(line: "", aborted: true)
     if takeSigQuit():
       goWordLeft() # 0x1C doubles as Ctrl+\ and Ctrl+<; never kill the shell
@@ -800,7 +764,7 @@ proc readLine*(pr: Prompt, hist: History, cfg: Config): LineResult =
       let sug = currentSug()
       if not dismissed and sel >= 0 and sel < sug.len:
         buf = sug[sel]
-      finalizeLine(pr, buf)
+      finalizeLine(pr, buf, "", prevCursorRow)
       return LineResult(line: buf)
     of kkTab:
       # filesystem / command completion; repeated Tab cycles candidates
@@ -875,7 +839,7 @@ proc readLine*(pr: Prompt, hist: History, cfg: Config): LineResult =
         render()
     of kkCtrlD:
       if buf.len == 0:
-        finalizeLine(pr, buf, "exit")
+        finalizeLine(pr, buf, "exit", prevCursorRow)
         return LineResult(line: "", eof: true)
       if cursor < buf.len:
         let tail = if cursor + 1 < buf.len: buf[cursor + 1 .. ^1] else: ""
@@ -986,7 +950,7 @@ proc readLine*(pr: Prompt, hist: History, cfg: Config): LineResult =
     of kkWordRight: # Ctrl+Right / Alt+Right / Ctrl+>
       goWordRight()
     of kkCtrlC:
-      finalizeLine(pr, buf, "^C")
+      finalizeLine(pr, buf, "^C", prevCursorRow)
       return LineResult(line: "", aborted: true)
     else:
       discard
